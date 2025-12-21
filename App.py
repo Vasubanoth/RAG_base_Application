@@ -13,7 +13,7 @@ from chromadb.config import Settings
 from groq import Groq
 
 # Set page config
-st.set_page_config(page_title="Multimodal AI Agent", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="Knowledge_base_RAG", layout="wide", page_icon="🤖")
 
 # --- AUTHENTICATION ---
 api_key = st.secrets.get("GROQ_API_KEY")
