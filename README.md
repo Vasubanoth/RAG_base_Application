@@ -1,4 +1,5 @@
-- A lightning-fast Retrieval-Augmented Generation (RAG) application built with Streamlit. This app allows you to upload PDF or TXT documents and chat with them using state-of-the-art LLMs like Llama 3.1 and Mixtral, powered by Groq's high-speed inference engine. here is the link to use the RAG based chat bot
+- A lightning-fast Retrieval-Augmented Generation (RAG) application built with Streamlit. This app allows you to upload PDF or TXT documents and chat with them using state-of-the-art LLMs like Llama 3.1 and Mixtral, powered by Groq's high-speed inference engine.
+- here is the link to use the RAG based chat bot : https://ragbaseapplication-nwkz5mfzdq8rv4bybnqxdp.streamlit.app/
 - A Retrieval-Augmented Generation (RAG) application built with Streamlit.
 - Allows users to upload PDF or TXT documents and chat with them.
 - Uses state-of-the-art LLMs like Llama 3.1 and Mixtral.
