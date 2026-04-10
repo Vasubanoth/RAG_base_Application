@@ -1,266 +1,274 @@
-try:
-    __import__('pysqlite3')
-    import sys
-    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-except ImportError:
-    pass  # pysqlite3 not available, use system sqlite3
-
-import os
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-os.environ["CHROMA_TELEMETRY"] = "False"
-
 import streamlit as st
+import os
 import tempfile
 from pypdf import PdfReader
-from fastembed import TextEmbedding
+from groq import Groq
 import chromadb
 from chromadb.config import Settings
-from groq import Groq
-import numpy as np
 
-# Set page config
-st.set_page_config(page_title="Knowledge Base RAG", layout="wide", page_icon="🤖")
+# Page config must be the first Streamlit command
+st.set_page_config(
+    page_title="Document Q&A Assistant",
+    page_icon="📚",
+    layout="wide"
+)
 
-# --- AUTHENTICATION ---
-api_key = st.secrets.get("GROQ_API_KEY")
-if not api_key:
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        api_key = os.getenv("GROQ_API_KEY")
-    except:
-        pass
-
-if not api_key:
-    with st.sidebar:
-        api_key = st.text_input("Groq API Key", type="password")
-    if not api_key:
-        st.warning("Please enter your Groq API Key to continue.")
-        st.stop()
-
-# --- LOAD RESOURCES (Cached) ---
+# Initialize Groq client
 @st.cache_resource
-def load_resources():
-    """Load embedding model and ChromaDB client"""
-    embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    DB_DIR = os.path.join(tempfile.gettempdir(), "chroma_db_persistent")
-    chroma_client = chromadb.PersistentClient(
-        path=DB_DIR, 
+def init_groq():
+    api_key = st.secrets.get("GROQ_API_KEY")
+    if not api_key:
+        api_key = os.getenv("GROQ_API_KEY")
+    return Groq(api_key=api_key)
+
+# Initialize ChromaDB
+@st.cache_resource
+def init_chromadb():
+    # Use temporary directory for persistent storage
+    db_path = os.path.join(tempfile.gettempdir(), "chroma_db")
+    os.makedirs(db_path, exist_ok=True)
+    
+    client = chromadb.PersistentClient(
+        path=db_path,
         settings=Settings(anonymized_telemetry=False)
     )
-    return embedder, chroma_client
+    return client
 
-# Initialize clients
-client = Groq(api_key=api_key)
-embedder, chroma_client = load_resources()
+# Simple text chunking
+def chunk_text(text, chunk_size=1000, overlap=200):
+    words = text.split()
+    chunks = []
+    
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = ' '.join(words[i:i + chunk_size])
+        if len(chunk) > 100:  # Only keep substantial chunks
+            chunks.append(chunk)
+    
+    return chunks
 
-def get_collection():
-    """Get or create the RAG collection"""
-    return chroma_client.get_or_create_collection(
-        name="rag_collection",
+# Extract text from PDF
+def extract_text_from_pdf(file):
+    try:
+        reader = PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading PDF: {str(e)}")
+        return ""
+
+# Process and store documents
+def process_documents(files, chroma_client, collection_name="documents"):
+    # Get or create collection
+    try:
+        chroma_client.delete_collection(collection_name)
+    except:
+        pass
+    
+    collection = chroma_client.create_collection(
+        name=collection_name,
         metadata={"hnsw:space": "cosine"}
     )
-
-# --- SIDEBAR: FILE UPLOADER ---
-with st.sidebar:
-    st.header("📁 Data Input")
-    st.info("Upload PDF or TXT files to build your knowledge base")
     
-    # File uploader for documents
-    uploaded_files = st.file_uploader(
-        "Upload Documents", 
-        type=["pdf", "txt"], 
-        accept_multiple_files=True
-    )
+    all_chunks = []
+    all_metadatas = []
+    all_ids = []
     
-    if uploaded_files:
-        st.markdown(f"**📄 Documents detected:** {len(uploaded_files)}")
-        process_btn = st.button("🚀 Process Documents", type="primary", use_container_width=True)
+    chunk_id = 0
+    
+    for file in files:
+        # Extract text based on file type
+        if file.name.endswith('.pdf'):
+            text = extract_text_from_pdf(file)
+        elif file.name.endswith('.txt'):
+            text = file.read().decode('utf-8')
+        else:
+            continue
+        
+        if not text.strip():
+            st.warning(f"No text found in {file.name}")
+            continue
+        
+        # Chunk the text
+        chunks = chunk_text(text)
+        
+        for chunk in chunks:
+            all_chunks.append(chunk)
+            all_metadatas.append({"source": file.name, "chunk_id": chunk_id})
+            all_ids.append(f"chunk_{chunk_id}")
+            chunk_id += 1
+    
+    if all_chunks:
+        # Add to ChromaDB (no embeddings needed for basic version)
+        collection.add(
+            documents=all_chunks,
+            metadatas=all_metadatas,
+            ids=all_ids
+        )
+        
+        st.success(f"✅ Processed {len(files)} files into {len(all_chunks)} chunks!")
+        return collection
+    else:
+        st.error("No text content found in uploaded files")
+        return None
 
-# --- PROCESSING LOGIC ---
-if uploaded_files and 'process_btn' in locals() and process_btn:
-    status = st.empty()
-    status.info("🔄 Processing documents...")
+# Search for relevant documents
+def search_documents(collection, query, n_results=3):
+    if collection is None:
+        return []
     
     try:
-        # Clear existing collection
-        try:
-            chroma_client.delete_collection("rag_collection")
-        except:
-            pass
+        # Simple keyword search (works without embeddings)
+        results = collection.query(
+            query_texts=[query],
+            n_results=n_results
+        )
         
-        collection = get_collection()
-        all_chunks = []
-        
-        # Extract text from all files
-        for file in uploaded_files:
-            text = ""
-            try:
-                if file.name.endswith(".pdf"):
-                    reader = PdfReader(file)
-                    for page in reader.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text += page_text
-                elif file.name.endswith(".txt"):
-                    text = file.read().decode("utf-8")
-                
-                # Chunk the text
-                chunk_size = 800
-                overlap = 100
-                for i in range(0, len(text), chunk_size - overlap):
-                    chunk = text[i:i + chunk_size].strip()
-                    if len(chunk) > 50:  # Only keep meaningful chunks
-                        all_chunks.append(chunk)
-                        
-            except Exception as e:
-                st.warning(f"⚠️ Error processing {file.name}: {str(e)}")
-                continue
-        
-        # Add chunks to database with embeddings
-        if all_chunks:
-            batch_size = 50  # Smaller batch size for stability
-            progress_bar = st.progress(0)
-            
-            for i in range(0, len(all_chunks), batch_size):
-                batch = all_chunks[i:i + batch_size]
-                
-                # Generate embeddings using fastembed
-                embeddings_generator = embedder.embed(batch)
-                embeddings = [emb.tolist() for emb in embeddings_generator]
-                
-                # Create IDs
-                ids = [f"chunk_{i + j}" for j in range(len(batch))]
-                
-                # Add to ChromaDB
-                collection.add(
-                    documents=batch,
-                    embeddings=embeddings,
-                    ids=ids
-                )
-                
-                # Update progress
-                progress_bar.progress(min(1.0, (i + batch_size) / len(all_chunks)))
-            
-            progress_bar.empty()
-            status.success(f"✅ Successfully indexed {len(all_chunks)} text chunks from {len(uploaded_files)} files!")
+        if results['documents'] and results['documents'][0]:
+            return results['documents'][0]
         else:
-            status.error("❌ No text content found in the uploaded files.")
-            
+            return []
     except Exception as e:
-        status.error(f"❌ Error processing documents: {str(e)}")
+        st.error(f"Search error: {str(e)}")
+        return []
 
-# --- CHAT INTERFACE ---
-st.title("🤖 RAG Knowledge Base Assistant")
-st.caption("Ask questions about your uploaded documents - the AI will search for relevant information!")
-
-# Initialize chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Display chat history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-        if "sources" in msg and msg["sources"]:
-            with st.expander("🔍 View Sources"):
-                for i, src in enumerate(msg["sources"][:3]):  # Show top 3 sources
-                    st.info(f"**Source {i+1}:** {src[:300]}...")
-
-# Check if collection has documents
-collection = get_collection()
-try:
-    collection_count = collection.count()
-    has_documents = collection_count > 0
-except:
-    has_documents = False
-
-# Chat input
-if prompt := st.chat_input("Ask a question about your documents..."):
-    # Add user message to history
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
+# Get answer from Groq
+def get_answer_from_groq(groq_client, question, context):
+    if not context:
+        return "I couldn't find relevant information in the documents. Please try a different question or upload more documents."
     
-    # Generate response
-    with st.chat_message("assistant"):
-        with st.spinner("🤔 Thinking..."):
-            try:
-                if has_documents:
-                    # Generate embedding for the question
-                    question_embedding = list(embedder.embed([prompt]))[0].tolist()
-                    
-                    # Search for relevant chunks
-                    results = collection.query(
-                        query_embeddings=[question_embedding],
-                        n_results=5
-                    )
-                    
-                    # Prepare context from search results
-                    source_docs = []
-                    context = ""
-                    
-                    if results['documents'] and results['documents'][0]:
-                        source_docs = results['documents'][0]
-                        # Join sources and limit context length
-                        context = "\n\n---\n\n".join(source_docs)
-                        if len(context) > 6000:
-                            context = context[:6000] + "..."
-                        
-                        # Create prompt with context
-                        system_prompt = f"""You are a helpful AI assistant answering questions based on the provided context.
+    prompt = f"""You are a helpful assistant. Answer the question based ONLY on the provided context.
 
-Context from documents:
+Context:
 {context}
 
-Question: {prompt}
+Question: {question}
 
 Instructions:
-1. Answer based ONLY on the context above
-2. If the answer isn't in the context, say "I cannot find this information in the provided documents"
-3. Be concise but thorough
-4. Cite specific information from the context when relevant
+1. Answer based solely on the context above
+2. If the answer is not in the context, say "I cannot find this information in the documents"
+3. Be concise and direct
+4. Quote relevant parts from the context if helpful
 
 Answer:"""
-                        
-                        # Get response from Groq
-                        response = client.chat.completions.create(
-                            model="llama-3.1-8b-instant",
-                            messages=[{"role": "user", "content": system_prompt}],
-                            temperature=0.3,
-                            max_tokens=500
-                        )
-                        answer = response.choices[0].message.content
-                    else:
-                        answer = "I couldn't find any relevant information in the uploaded documents. Please try asking a different question or upload more documents."
-                        source_docs = []
-                else:
-                    # No documents uploaded yet
-                    answer = "📚 **No documents have been uploaded yet!**\n\nPlease upload PDF or TXT files in the sidebar and click 'Process Documents' before asking questions."
-                    source_docs = []
-                
-                # Display answer
-                st.write(answer)
-                
-                # Show sources if available
-                if source_docs:
-                    with st.expander("🔍 View Sources"):
-                        for i, src in enumerate(source_docs[:3]):
-                            st.info(f"**Source {i+1}:** {src[:300]}...")
-                
-                # Save to history
-                msg_data = {"role": "assistant", "content": answer}
-                if source_docs:
-                    msg_data["sources"] = source_docs
-                st.session_state.messages.append(msg_data)
-                
-            except Exception as e:
-                error_msg = f"❌ Error: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
-# Display info when no documents
-if not has_documents and not uploaded_files:
-    st.info("👈 **Get Started:** Upload PDF or TXT files in the sidebar and click 'Process Documents' to build your knowledge base!")
-elif not has_documents and uploaded_files:
-    st.warning("⚠️ **Documents uploaded but not processed!** Click 'Process Documents' in the sidebar to index them.")
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",  # Free tier model
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error getting response: {str(e)}"
+
+# Main UI
+def main():
+    st.title("📚 Document Q&A Assistant")
+    st.markdown("Upload PDF or TXT documents and ask questions about their content!")
+    
+    # Initialize clients
+    groq_client = init_groq()
+    chroma_client = init_chromadb()
+    
+    # Sidebar for file upload
+    with st.sidebar:
+        st.header("📁 Document Upload")
+        
+        uploaded_files = st.file_uploader(
+            "Choose files",
+            type=['pdf', 'txt'],
+            accept_multiple_files=True,
+            help="Upload PDF or TXT documents"
+        )
+        
+        if uploaded_files:
+            if st.button("🔄 Process Documents", type="primary", use_container_width=True):
+                with st.spinner("Processing documents..."):
+                    collection = process_documents(uploaded_files, chroma_client)
+                    st.session_state['collection'] = collection
+                    st.session_state['documents_processed'] = True
+                    st.rerun()
+        
+        st.divider()
+        
+        # Display status
+        if 'documents_processed' in st.session_state and st.session_state['documents_processed']:
+            st.success("✅ Documents ready for Q&A!")
+        else:
+            st.info("📤 Upload and process documents to start asking questions")
+    
+    # Main chat area
+    if 'documents_processed' in st.session_state and st.session_state['documents_processed']:
+        # Initialize chat history
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        
+        # Display chat history
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                if "sources" in message and message["sources"]:
+                    with st.expander("📖 View Sources"):
+                        for i, source in enumerate(message["sources"][:2]):
+                            st.text(f"Source {i+1}: {source[:200]}...")
+        
+        # Chat input
+        if prompt := st.chat_input("Ask a question about your documents..."):
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Get response
+            with st.chat_message("assistant"):
+                with st.spinner("Searching documents..."):
+                    # Search for relevant content
+                    collection = st.session_state['collection']
+                    relevant_chunks = search_documents(collection, prompt)
+                    
+                    # Prepare context
+                    context = "\n\n".join(relevant_chunks) if relevant_chunks else ""
+                    
+                    # Get answer from Groq
+                    answer = get_answer_from_groq(groq_client, prompt, context)
+                    
+                    # Display answer
+                    st.markdown(answer)
+                    
+                    # Show sources if available
+                    if relevant_chunks:
+                        with st.expander("📖 View Sources"):
+                            for i, chunk in enumerate(relevant_chunks[:2]):
+                                st.info(f"**Source {i+1}:** {chunk[:300]}...")
+                    
+                    # Save to history
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": relevant_chunks if relevant_chunks else []
+                    })
+    else:
+        # No documents processed yet
+        st.info("👈 **Get Started:** Upload PDF or TXT files in the sidebar and click 'Process Documents'")
+        
+        # Show example
+        with st.expander("📖 How to use"):
+            st.markdown("""
+            1. **Upload documents** (PDF or TXT) using the sidebar
+            2. **Click "Process Documents"** to index the content
+            3. **Ask questions** about your documents in the chat
+            4. The AI will search and answer based on the document content
+            
+            **Example questions:**
+            - "What are the main topics discussed?"
+            - "Summarize the key points"
+            - "Find information about [specific topic]"
+            """)
+
+if __name__ == "__main__":
+    main()
